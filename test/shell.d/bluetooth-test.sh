@@ -151,11 +151,17 @@ trap 'rm -rf "$device_tmp"' EXIT
 mock_bin="$device_tmp/bin"
 mkdir -p "$mock_bin"
 export POWERED_FILE="$device_tmp/powered"
+export BONDED_FILE="$device_tmp/bonded"
 
 cat >"$mock_bin/bluetoothctl" <<'SH'
 #!/bin/bash
 
 printf '%s\n' "$*" >>"$BLUETOOTHCTL_LOG"
+if [[ $1 == "info" ]]; then
+  printf '\tPaired: %s\n\tBonded: %s\n\tTrusted: yes\n' "${MOCK_PAIRED:-yes}" "$(cat "$BONDED_FILE")"
+fi
+[[ $1 == "pair" && ${MOCK_PAIR_FAIL:-0} == 1 ]] && exit 1
+[[ $1 == "pair" && ${MOCK_SAVE_BOND:-1} == 1 ]] && echo yes >"$BONDED_FILE"
 [[ $1 == "power" && $2 == "on" ]] && echo yes >"$POWERED_FILE"
 [[ $1 == "list" ]] &&
   for c in ${MOCK_CONTROLLERS:-AA:BB:CC:DD:EE:FF}; do printf 'Controller %s mock\n' "$c"; done
@@ -166,6 +172,13 @@ if [[ $1 == "show" ]]; then
   printf '\tPowered: %s\n' "$(cat "$state")"
 fi
 exit 0
+SH
+
+cat >"$mock_bin/systemctl" <<'SH'
+#!/bin/bash
+
+printf 'systemctl %s\n' "$*" >>"$BLUETOOTHCTL_LOG"
+exit "${MOCK_AGENT_STATUS:-0}"
 SH
 
 cat >"$mock_bin/rfkill" <<'SH'
@@ -180,7 +193,7 @@ printf 'rfkill %s\n' "$*" >>"$BLUETOOTHCTL_LOG"
 exit 0
 SH
 
-chmod +x "$mock_bin/bluetoothctl" "$mock_bin/rfkill"
+chmod +x "$mock_bin/bluetoothctl" "$mock_bin/rfkill" "$mock_bin/systemctl"
 
 # $ROOT/bin so omarchy-bluetooth-device resolves the real omarchy-bluetooth-power.
 bluetooth_run() {
@@ -188,6 +201,7 @@ bluetooth_run() {
   shift
 
   echo "$powered" >"$POWERED_FILE"
+  echo "${MOCK_BONDED:-yes}" >"$BONDED_FILE"
   : >"$device_tmp/log"
   PATH="$mock_bin:$ROOT/bin:$PATH" BLUETOOTHCTL_LOG="$device_tmp/log" \
     OMARCHY_BLUETOOTH_POWER_WAIT_SECONDS=0 "$@" ||
@@ -262,6 +276,55 @@ pass "bluetooth lifts the block before connecting"
 grep -qx "connect AA:BB:CC:DD:EE:FF" "$unpowered_log" ||
   fail "bluetooth connects once the adapter is up" "$(cat "$unpowered_log")"
 pass "bluetooth connects once the adapter is up"
+
+grep -Eq '^(pair |systemctl )' "$unpowered_log" &&
+  fail "bluetooth leaves paired devices and the agent alone when reconnecting"
+pass "bluetooth leaves paired devices and the agent alone when reconnecting"
+
+repair_log=$(MOCK_PAIRED=no MOCK_BONDED=no bluetooth_device_log yes)
+expected_repair=$(printf '%s\n' \
+  'info AA:BB:CC:DD:EE:FF' \
+  'show' \
+  'systemctl --user start bt-agent.service' \
+  'untrust AA:BB:CC:DD:EE:FF' \
+  'pair AA:BB:CC:DD:EE:FF' \
+  'info AA:BB:CC:DD:EE:FF' \
+  'trust AA:BB:CC:DD:EE:FF' \
+  'connect AA:BB:CC:DD:EE:FF')
+[[ $(cat "$repair_log") == "$expected_repair" ]] ||
+  fail "bluetooth pairs trusted devices without keys before connecting" "$(cat "$repair_log")"
+pass "bluetooth pairs trusted devices without keys before connecting"
+
+temporary_log=$(MOCK_PAIRED=yes MOCK_BONDED=no bluetooth_device_log yes)
+grep -qx 'disconnect AA:BB:CC:DD:EE:FF' "$temporary_log" ||
+  fail "bluetooth clears temporary pairing before requesting a saved bond" "$(cat "$temporary_log")"
+grep -qx 'pair AA:BB:CC:DD:EE:FF' "$temporary_log" ||
+  fail "bluetooth replaces temporary pairing with a saved bond" "$(cat "$temporary_log")"
+pass "bluetooth replaces temporary pairing with a saved bond"
+
+# A failed pair must not create a trusted record that subsequent clicks connect.
+for failure in pair agent bond; do
+  : >"$device_tmp/log"
+  echo no >"$BONDED_FILE"
+  pair_fail=0
+  agent_status=0
+  save_bond=1
+  if [[ $failure == "pair" ]]; then
+    pair_fail=1
+  elif [[ $failure == "agent" ]]; then
+    agent_status=1
+  else
+    save_bond=0
+  fi
+  if PATH="$mock_bin:$ROOT/bin:$PATH" BLUETOOTHCTL_LOG="$device_tmp/log" \
+    MOCK_PAIR_FAIL="$pair_fail" MOCK_AGENT_STATUS="$agent_status" MOCK_SAVE_BOND="$save_bond" \
+    "$ROOT/bin/omarchy-bluetooth-device" pair AA:BB:CC:DD:EE:FF; then
+    fail "bluetooth reports $failure failure"
+  fi
+  grep -Eq '^(trust |connect )' "$device_tmp/log" &&
+    fail "bluetooth does not trust or connect after $failure failure" "$(cat "$device_tmp/log")"
+  pass "bluetooth does not trust or connect after $failure failure"
+done
 
 # Blocking hits every radio at once, so the read has to span them too. A bare
 # bluetoothctl show reports the default controller and misses a powered dongle.

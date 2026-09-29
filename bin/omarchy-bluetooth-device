@@ -29,10 +29,30 @@ trust_device() {
   bluetoothctl trust "$address" >/dev/null 2>&1 || true
 }
 
+# Paired can describe temporary encryption; only Bonded means saved keys.
+if [[ $action == "pair" || $action == "connect" ]]; then
+  device_info=$(timeout 2s bluetoothctl info "$address" 2>/dev/null)
+  if [[ $action == "connect" && $device_info != *"Bonded: yes"* ]]; then
+    action=pair
+  fi
+fi
+
 case "$action" in
   pair)
     power_on
-    timeout 20s bluetoothctl pair "$address" >/dev/null 2>&1 || true
+    systemctl --user start bt-agent.service
+    if [[ $device_info != *"Bonded: yes"* ]]; then
+      bluetoothctl untrust "$address" >/dev/null
+      # BlueZ treats Pair on a temporarily paired session as Connect.
+      if [[ $device_info == *"Paired: yes"* || $device_info == *"Connected: yes"* ]]; then
+        timeout 10s bluetoothctl disconnect "$address" >/dev/null
+      fi
+    fi
+    timeout 20s bluetoothctl pair "$address" >/dev/null
+    if [[ $(timeout 2s bluetoothctl info "$address" 2>/dev/null) != *"Bonded: yes"* ]]; then
+      echo "Bluetooth pairing did not save a bond for $address" >&2
+      exit 1
+    fi
     trust_device
     timeout 20s bluetoothctl connect "$address" >/dev/null 2>&1 || true
     ;;
