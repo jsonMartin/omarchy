@@ -158,9 +158,10 @@ cat >"$mock_bin/bluetoothctl" <<'SH'
 
 printf '%s\n' "$*" >>"$BLUETOOTHCTL_LOG"
 if [[ $1 == "info" ]]; then
-  printf '\tPaired: %s\n\tBonded: %s\n\tTrusted: yes\n' "${MOCK_PAIRED:-yes}" "$(cat "$BONDED_FILE")"
+  printf '\tName: %s\n\tPaired: %s\n\tBonded: %s\n\tTrusted: yes\n\tConnected: yes\n' "${MOCK_NAME:-Mouse}" "${MOCK_PAIRED:-yes}" "$(cat "$BONDED_FILE")"
 fi
 [[ $1 == "pair" && ${MOCK_PAIR_FAIL:-0} == 1 ]] && exit 1
+[[ $1 == "disconnect" && ${MOCK_DISCONNECT_FAIL:-0} == 1 ]] && exit 1
 [[ $1 == "pair" && ${MOCK_SAVE_BOND:-1} == 1 ]] && echo yes >"$BONDED_FILE"
 [[ $1 == "power" && $2 == "on" ]] && echo yes >"$POWERED_FILE"
 [[ $1 == "list" ]] &&
@@ -281,6 +282,13 @@ grep -Eq '^(pair |systemctl )' "$unpowered_log" &&
   fail "bluetooth leaves paired devices and the agent alone when reconnecting"
 pass "bluetooth leaves paired devices and the agent alone when reconnecting"
 
+bonded_pair_log=$(bluetooth_run yes "$ROOT/bin/omarchy-bluetooth-device" pair AA:BB:CC:DD:EE:FF)
+grep -qx 'connect AA:BB:CC:DD:EE:FF' "$bonded_pair_log" ||
+  fail "bluetooth pair reconnects an already bonded device"
+grep -Eq '^(pair |systemctl |untrust |disconnect )' "$bonded_pair_log" &&
+  fail "bluetooth pair preserves an existing bond" "$(cat "$bonded_pair_log")"
+pass "bluetooth pair preserves an existing bond"
+
 repair_log=$(MOCK_PAIRED=no MOCK_BONDED=no bluetooth_device_log yes)
 expected_repair=$(printf '%s\n' \
   'info AA:BB:CC:DD:EE:FF' \
@@ -295,35 +303,25 @@ expected_repair=$(printf '%s\n' \
   fail "bluetooth pairs trusted devices without keys before connecting" "$(cat "$repair_log")"
 pass "bluetooth pairs trusted devices without keys before connecting"
 
-temporary_log=$(MOCK_PAIRED=yes MOCK_BONDED=no bluetooth_device_log yes)
-grep -qx 'disconnect AA:BB:CC:DD:EE:FF' "$temporary_log" ||
-  fail "bluetooth clears temporary pairing before requesting a saved bond" "$(cat "$temporary_log")"
-grep -qx 'pair AA:BB:CC:DD:EE:FF' "$temporary_log" ||
+# A stale disconnect result must not prevent a fresh pairing request.
+temporary_log=$(MOCK_PAIRED=yes MOCK_BONDED=no MOCK_DISCONNECT_FAIL=1 bluetooth_device_log yes)
+expected_temporary=${expected_repair/'pair AA:BB:CC:DD:EE:FF'/$'disconnect AA:BB:CC:DD:EE:FF\npair AA:BB:CC:DD:EE:FF'}
+[[ $(cat "$temporary_log") == "$expected_temporary" ]] ||
   fail "bluetooth replaces temporary pairing with a saved bond" "$(cat "$temporary_log")"
 pass "bluetooth replaces temporary pairing with a saved bond"
 
 # A failed pair must not create a trusted record that subsequent clicks connect.
-for failure in pair agent bond; do
+for setting in MOCK_PAIR_FAIL=1 MOCK_AGENT_STATUS=1 MOCK_SAVE_BOND=0; do
   : >"$device_tmp/log"
   echo no >"$BONDED_FILE"
-  pair_fail=0
-  agent_status=0
-  save_bond=1
-  if [[ $failure == "pair" ]]; then
-    pair_fail=1
-  elif [[ $failure == "agent" ]]; then
-    agent_status=1
-  else
-    save_bond=0
-  fi
-  if PATH="$mock_bin:$ROOT/bin:$PATH" BLUETOOTHCTL_LOG="$device_tmp/log" \
-    MOCK_PAIR_FAIL="$pair_fail" MOCK_AGENT_STATUS="$agent_status" MOCK_SAVE_BOND="$save_bond" \
+  if env PATH="$mock_bin:$ROOT/bin:$PATH" BLUETOOTHCTL_LOG="$device_tmp/log" \
+    MOCK_NAME='Bonded: yes' "$setting" \
     "$ROOT/bin/omarchy-bluetooth-device" pair AA:BB:CC:DD:EE:FF; then
-    fail "bluetooth reports $failure failure"
+    fail "bluetooth reports failure with $setting"
   fi
   grep -Eq '^(trust |connect )' "$device_tmp/log" &&
-    fail "bluetooth does not trust or connect after $failure failure" "$(cat "$device_tmp/log")"
-  pass "bluetooth does not trust or connect after $failure failure"
+    fail "bluetooth does not trust or connect with $setting" "$(cat "$device_tmp/log")"
+  pass "bluetooth does not trust or connect with $setting"
 done
 
 # Blocking hits every radio at once, so the read has to span them too. A bare
