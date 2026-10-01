@@ -157,8 +157,19 @@ cat >"$mock_bin/bluetoothctl" <<'SH'
 #!/bin/bash
 
 printf '%s\n' "$*" >>"$BLUETOOTHCTL_LOG"
-# MOCK_INFO_FAIL fails only the first lookup, like a device BlueZ has not cached yet.
-[[ $1 == "info" && ${MOCK_INFO_FAIL:-0} == "1" && $(grep -c '^info ' "$BLUETOOTHCTL_LOG") == "1" ]] && exit 1
+# MOCK_INFO_FAIL_AT=N fails the Nth lookup silently; MOCK_INFO=down fails every
+# lookup; MOCK_INFO=missing reports an uncached device until it is paired.
+if [[ $1 == "info" ]]; then
+  [[ $(grep -c '^info ' "$BLUETOOTHCTL_LOG") == "${MOCK_INFO_FAIL_AT:-0}" ]] && exit 1
+  if [[ ${MOCK_INFO:-} == "down" ]]; then
+    echo "DeviceSet $2 not available"
+    exit 1
+  fi
+  if [[ ${MOCK_INFO:-} == "missing" ]] && ! grep -q '^pair ' "$BLUETOOTHCTL_LOG"; then
+    echo "Device $2 not available"
+    exit 1
+  fi
+fi
 if [[ $1 == "info" ]]; then
   printf '\tName: %s\n\tPaired: %s\n\tBonded: %s\n\tTrusted: yes\n\tConnected: yes\n' "${MOCK_NAME:-Mouse}" "${MOCK_PAIRED:-yes}" "$(cat "$BONDED_FILE")"
 fi
@@ -306,22 +317,48 @@ expected_repair=$(printf '%s\n' \
   fail "bluetooth pairs trusted devices without keys before connecting" "$(cat "$repair_log")"
 pass "bluetooth pairs trusted devices without keys before connecting"
 
-# BlueZ fails untrust and info for a device it has not cached yet, and info
-# also fails while the adapter is down. Neither may stop the recovery.
-fresh_pair_log=$(MOCK_UNTRUST_FAIL=1 MOCK_INFO_FAIL=1 MOCK_BONDED=no bluetooth_run no "$ROOT/bin/omarchy-bluetooth-device" pair AA:BB:CC:DD:EE:FF)
+# BlueZ fails untrust and info for a device it has not cached yet. Neither may
+# stop a fresh pairing, even with the adapter starting down.
+fresh_pair_log=$(MOCK_UNTRUST_FAIL=1 MOCK_INFO=missing MOCK_BONDED=no bluetooth_run no "$ROOT/bin/omarchy-bluetooth-device" pair AA:BB:CC:DD:EE:FF)
 for step in 'rfkill unblock bluetooth' 'pair AA:BB:CC:DD:EE:FF' 'connect AA:BB:CC:DD:EE:FF'; do
   grep -qx "$step" "$fresh_pair_log" ||
     fail "bluetooth pairs a new device despite failed info and untrust: missing '$step'" "$(cat "$fresh_pair_log")"
 done
 pass "bluetooth pairs a new device despite failed info and untrust"
 
-# A transient lookup failure on a bonded device must never reach untrust or pair.
-flaky_log=$(MOCK_INFO_FAIL=1 MOCK_BONDED=yes bluetooth_device_log yes)
+# A transient lookup failure is retried, so it routes by the real bond state.
+flaky_log=$(MOCK_INFO_FAIL_AT=1 MOCK_BONDED=yes bluetooth_device_log yes)
 grep -Eq '^(untrust |pair )' "$flaky_log" &&
-  fail "bluetooth connect keeps the bond when info fails" "$(cat "$flaky_log")"
+  fail "bluetooth keeps a bond through a transient lookup failure" "$(cat "$flaky_log")"
 grep -qx 'connect AA:BB:CC:DD:EE:FF' "$flaky_log" ||
-  fail "bluetooth connect still connects when info fails" "$(cat "$flaky_log")"
-pass "bluetooth connect keeps the bond when info fails"
+  fail "bluetooth connects through a transient lookup failure" "$(cat "$flaky_log")"
+pass "bluetooth keeps a bond through a transient lookup failure"
+
+flaky_unbonded_log=$(MOCK_INFO_FAIL_AT=1 MOCK_BONDED=no bluetooth_device_log yes)
+grep -qx 'pair AA:BB:CC:DD:EE:FF' "$flaky_unbonded_log" ||
+  fail "bluetooth still pairs a trusted unbonded device after a transient lookup failure" "$(cat "$flaky_unbonded_log")"
+pass "bluetooth still pairs a trusted unbonded device after a transient lookup failure"
+
+# A successful pair must survive one failed verification lookup.
+flaky_verify_log=$(MOCK_INFO_FAIL_AT=2 MOCK_BONDED=no bluetooth_device_log yes)
+grep -qx 'connect AA:BB:CC:DD:EE:FF' "$flaky_verify_log" ||
+  fail "bluetooth connects after a transient verification failure" "$(cat "$flaky_verify_log")"
+pass "bluetooth connects after a transient verification failure"
+
+# State that stays unreadable must change nothing, for either request.
+for action in connect pair; do
+  : >"$device_tmp/log"
+  echo yes >"$BONDED_FILE"
+  if env PATH="$mock_bin:$ROOT/bin:$PATH" BLUETOOTHCTL_LOG="$device_tmp/log" MOCK_INFO=down \
+    "$ROOT/bin/omarchy-bluetooth-device" $action AA:BB:CC:DD:EE:FF 2>/dev/null; then
+    fail "bluetooth $action reports unreadable device state"
+  fi
+  grep -Eq '^(untrust |pair |trust |connect )' "$device_tmp/log" &&
+    fail "bluetooth $action changes nothing when device state is unreadable" "$(cat "$device_tmp/log")"
+  (( $(grep -c '^info ' "$device_tmp/log") == 3 )) ||
+    fail "bluetooth $action retries an unreadable lookup" "$(cat "$device_tmp/log")"
+  pass "bluetooth $action changes nothing when device state is unreadable"
+done
 
 # A stale disconnect result must not prevent a fresh pairing request.
 temporary_log=$(MOCK_PAIRED=yes MOCK_BONDED=no MOCK_DISCONNECT_FAIL=1 bluetooth_device_log yes)
