@@ -157,9 +157,12 @@ cat >"$mock_bin/bluetoothctl" <<'SH'
 #!/bin/bash
 
 printf '%s\n' "$*" >>"$BLUETOOTHCTL_LOG"
+# MOCK_INFO_FAIL fails only the first lookup, like a device BlueZ has not cached yet.
+[[ $1 == "info" && ${MOCK_INFO_FAIL:-0} == "1" && $(grep -c '^info ' "$BLUETOOTHCTL_LOG") == "1" ]] && exit 1
 if [[ $1 == "info" ]]; then
   printf '\tName: %s\n\tPaired: %s\n\tBonded: %s\n\tTrusted: yes\n\tConnected: yes\n' "${MOCK_NAME:-Mouse}" "${MOCK_PAIRED:-yes}" "$(cat "$BONDED_FILE")"
 fi
+[[ $1 == "untrust" && ${MOCK_UNTRUST_FAIL:-0} == "1" ]] && exit 1
 [[ $1 == "pair" && ${MOCK_PAIR_FAIL:-0} == 1 ]] && exit 1
 [[ $1 == "disconnect" && ${MOCK_DISCONNECT_FAIL:-0} == 1 ]] && exit 1
 [[ $1 == "pair" && ${MOCK_SAVE_BOND:-1} == 1 ]] && echo yes >"$BONDED_FILE"
@@ -291,8 +294,8 @@ pass "bluetooth pair preserves an existing bond"
 
 repair_log=$(MOCK_PAIRED=no MOCK_BONDED=no bluetooth_device_log yes)
 expected_repair=$(printf '%s\n' \
-  'info AA:BB:CC:DD:EE:FF' \
   'show' \
+  'info AA:BB:CC:DD:EE:FF' \
   'systemctl --user start bt-agent.service' \
   'untrust AA:BB:CC:DD:EE:FF' \
   'pair AA:BB:CC:DD:EE:FF' \
@@ -302,6 +305,23 @@ expected_repair=$(printf '%s\n' \
 [[ $(cat "$repair_log") == "$expected_repair" ]] ||
   fail "bluetooth pairs trusted devices without keys before connecting" "$(cat "$repair_log")"
 pass "bluetooth pairs trusted devices without keys before connecting"
+
+# BlueZ fails untrust and info for a device it has not cached yet, and info
+# also fails while the adapter is down. Neither may stop the recovery.
+fresh_pair_log=$(MOCK_UNTRUST_FAIL=1 MOCK_INFO_FAIL=1 MOCK_BONDED=no bluetooth_run no "$ROOT/bin/omarchy-bluetooth-device" pair AA:BB:CC:DD:EE:FF)
+for step in 'rfkill unblock bluetooth' 'pair AA:BB:CC:DD:EE:FF' 'connect AA:BB:CC:DD:EE:FF'; do
+  grep -qx "$step" "$fresh_pair_log" ||
+    fail "bluetooth pairs a new device despite failed info and untrust: missing '$step'" "$(cat "$fresh_pair_log")"
+done
+pass "bluetooth pairs a new device despite failed info and untrust"
+
+# A transient lookup failure on a bonded device must never reach untrust or pair.
+flaky_log=$(MOCK_INFO_FAIL=1 MOCK_BONDED=yes bluetooth_device_log yes)
+grep -Eq '^(untrust |pair )' "$flaky_log" &&
+  fail "bluetooth connect keeps the bond when info fails" "$(cat "$flaky_log")"
+grep -qx 'connect AA:BB:CC:DD:EE:FF' "$flaky_log" ||
+  fail "bluetooth connect still connects when info fails" "$(cat "$flaky_log")"
+pass "bluetooth connect keeps the bond when info fails"
 
 # A stale disconnect result must not prevent a fresh pairing request.
 temporary_log=$(MOCK_PAIRED=yes MOCK_BONDED=no MOCK_DISCONNECT_FAIL=1 bluetooth_device_log yes)

@@ -31,19 +31,22 @@ trust_device() {
 
 # Paired can describe temporary encryption; only Bonded means saved keys.
 if [[ $action == "pair" || $action == "connect" ]]; then
-  device_info=$(timeout 2s bluetoothctl info "$address" 2>/dev/null)
-  if [[ $device_info == *$'\n\tBonded: yes\n'* ]]; then
-    action=connect
-  else
-    action=pair
+  power_on
+  # A failed lookup (uncached device, timeout) proves nothing about the bond, so keep the
+  # requested action rather than re-pairing a device that may be bonded.
+  if device_info=$(timeout 2s bluetoothctl info "$address" 2>/dev/null); then
+    if [[ $device_info == *$'\n\tBonded: yes\n'* ]]; then
+      action=connect
+    else
+      action=pair
+    fi
   fi
 fi
 
 case "$action" in
   pair)
-    power_on
     systemctl --user start bt-agent.service
-    bluetoothctl untrust "$address" >/dev/null
+    timeout 10s bluetoothctl untrust "$address" >/dev/null 2>&1 || true
     # Clear temporary encryption so Pair negotiates saved keys.
     if [[ $device_info == *$'\n\tPaired: yes\n'* ]]; then
       timeout 10s bluetoothctl disconnect "$address" >/dev/null 2>&1 || true
@@ -57,7 +60,6 @@ case "$action" in
     timeout 20s bluetoothctl connect "$address" >/dev/null 2>&1 || true
     ;;
   connect)
-    power_on
     trust_device
     timeout 20s bluetoothctl connect "$address" >/dev/null 2>&1 || true
     ;;
